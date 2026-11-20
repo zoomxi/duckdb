@@ -2,6 +2,9 @@
 #include "duckdb/execution/operator/aggregate/physical_window.hpp"
 
 #include "duckdb/common/once_flag.hpp"
+#include "duckdb/common/unordered_map.hpp"
+#include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/function/create_sort_key.hpp"
 #include "duckdb/common/sorting/sort_strategy.hpp"
 #include "duckdb/common/types/row/tuple_data_collection.hpp"
 #include "duckdb/common/types/row/tuple_data_iterator.hpp"
@@ -244,6 +247,151 @@ public:
 	}
 };
 
+//! Drops the rows that cannot rank within a rank() bound before they are sorted
+class WindowRankPrefilter {
+public:
+	//! The heaps of one thread stop filtering once they hold this many bytes
+	static constexpr idx_t MAX_HEAP_BYTES = 64ULL * 1024ULL * 1024ULL;
+	//! Bookkeeping charged for each partition key
+	static constexpr idx_t PARTITION_BYTES = 64;
+	//! A prefilter that still keeps more than half of the rows after this many stops filtering
+	static constexpr idx_t PROBE_ROWS = 1000000;
+
+	WindowRankPrefilter(ClientContext &client, const BoundWindowExpression &wexpr, idx_t limit);
+
+	//! Writes the rows of input that may still rank within the bound to sel and returns their count
+	idx_t Select(DataChunk &input, SelectionVector &sel);
+
+private:
+	static bool KeyLess(const string &lhs, const string &rhs) {
+		return string_t(lhs) < string_t(rhs);
+	}
+	bool Keep(vector<string> &heap, const string_t &key);
+	void StopFiltering();
+
+	const idx_t limit;
+	const bool has_partitions;
+	ExpressionExecutor partition_executor;
+	ExpressionExecutor order_executor;
+	vector<OrderModifiers> partition_modifiers;
+	vector<OrderModifiers> order_modifiers;
+	DataChunk partition_chunk;
+	DataChunk order_chunk;
+	DataChunk partition_keys;
+	DataChunk order_keys;
+	//! Per partition sort key, a max heap of the best order sort keys: the worst kept key is at the front
+	unordered_map<string, vector<string>> heaps;
+	idx_t heap_bytes = 0;
+	idx_t rows_seen = 0;
+	idx_t rows_kept = 0;
+	bool probed = false;
+	bool filtering = true;
+};
+
+WindowRankPrefilter::WindowRankPrefilter(ClientContext &client, const BoundWindowExpression &wexpr, idx_t limit)
+    : limit(limit), has_partitions(!wexpr.Partitions().empty()), partition_executor(client), order_executor(client) {
+	D_ASSERT(limit > 0);
+	D_ASSERT(!wexpr.OrderBy().empty());
+	auto &allocator = BufferAllocator::Get(client);
+	const vector<LogicalType> key_types {LogicalType::BLOB};
+
+	vector<LogicalType> partition_types;
+	for (auto &partition : wexpr.Partitions()) {
+		partition_executor.AddExpression(*partition);
+		partition_types.push_back(partition->GetReturnType());
+		partition_modifiers.emplace_back(OrderType::ASCENDING, OrderByNullType::NULLS_LAST);
+	}
+	if (has_partitions) {
+		partition_chunk.Initialize(allocator, partition_types);
+		partition_keys.Initialize(allocator, key_types);
+	}
+
+	vector<LogicalType> order_types;
+	for (auto &order : wexpr.OrderBy()) {
+		order_executor.AddExpression(*order.expression);
+		order_types.push_back(order.expression->GetReturnType());
+		order_modifiers.emplace_back(order.type, order.null_order);
+	}
+	order_chunk.Initialize(allocator, order_types);
+	order_keys.Initialize(allocator, key_types);
+}
+
+bool WindowRankPrefilter::Keep(vector<string> &heap, const string_t &key) {
+	if (heap.size() < limit) {
+		heap.push_back(key.GetString());
+		std::push_heap(heap.begin(), heap.end(), KeyLess);
+		heap_bytes += key.GetSize() + sizeof(string);
+		return true;
+	}
+	const string_t worst(heap.front());
+	if (worst < key) {
+		return false;
+	}
+	if (key < worst) {
+		std::pop_heap(heap.begin(), heap.end(), KeyLess);
+		heap_bytes -= heap.back().size();
+		heap.back() = key.GetString();
+		heap_bytes += key.GetSize();
+		std::push_heap(heap.begin(), heap.end(), KeyLess);
+	}
+	return true;
+}
+
+void WindowRankPrefilter::StopFiltering() {
+	filtering = false;
+	heaps = unordered_map<string, vector<string>>();
+	heap_bytes = 0;
+}
+
+idx_t WindowRankPrefilter::Select(DataChunk &input, SelectionVector &sel) {
+	const auto count = input.size();
+	if (!filtering) {
+		return count;
+	}
+
+	//	Sort keys compare like the window sort: direction, NULL order, NaN and -0.0 included
+	if (has_partitions) {
+		partition_chunk.Reset();
+		partition_executor.Execute(input, partition_chunk);
+		partition_keys.Reset();
+		CreateSortKeyHelpers::CreateSortKey(partition_chunk, partition_modifiers, partition_keys.data[0]);
+	}
+	order_chunk.Reset();
+	order_executor.Execute(input, order_chunk);
+	order_keys.Reset();
+	CreateSortKeyHelpers::CreateSortKey(order_chunk, order_modifiers, order_keys.data[0]);
+
+	const auto order_key_data = FlatVector::GetData<string_t>(order_keys.data[0]);
+	const auto partition_key_data = has_partitions ? FlatVector::GetData<string_t>(partition_keys.data[0]) : nullptr;
+	idx_t kept = 0;
+	for (idx_t row_idx = 0; row_idx < count; row_idx++) {
+		string partition_key;
+		if (has_partitions) {
+			partition_key = partition_key_data[row_idx].GetString();
+		}
+		auto entry = heaps.find(partition_key);
+		if (entry == heaps.end()) {
+			heap_bytes += partition_key.size() + PARTITION_BYTES;
+			entry = heaps.emplace(std::move(partition_key), vector<string>()).first;
+		}
+		if (Keep(entry->second, order_key_data[row_idx])) {
+			sel.set_index(kept++, row_idx);
+		}
+	}
+
+	rows_seen += count;
+	rows_kept += kept;
+	if (heap_bytes > MAX_HEAP_BYTES) {
+		StopFiltering();
+	} else if (!probed && rows_seen >= PROBE_ROWS) {
+		probed = true;
+		if (rows_kept * 2 > rows_seen) {
+			StopFiltering();
+		}
+	}
+	return kept;
+}
+
 //	Per-thread sink state
 class WindowLocalSinkState : public LocalSinkState {
 public:
@@ -252,9 +400,17 @@ public:
 
 	WindowLocalSinkState(ExecutionContext &context, const WindowGlobalSinkState &gstate)
 	    : local_group(gstate.sort_strategy->GetLocalSinkState(context)) {
+		if (gstate.op.partition_limit.IsValid()) {
+			rank_prefilter = CreatePrefilter(context, gstate);
+			prefilter_sel.Initialize(STANDARD_VECTOR_SIZE);
+			prefiltered.InitializeEmpty(gstate.op.children[0].get().GetTypes());
+		}
 	}
 
 	LocalStatePtr local_group;
+	unique_ptr<WindowRankPrefilter> rank_prefilter;
+	SelectionVector prefilter_sel;
+	DataChunk prefiltered;
 
 	bool SupportsReuse() const override {
 		return true;
@@ -263,6 +419,17 @@ public:
 	void Reset(ExecutionContext &context, GlobalSinkState &gstate_p) override {
 		auto &gstate = gstate_p.Cast<WindowGlobalSinkState>();
 		local_group = gstate.sort_strategy->GetLocalSinkState(context);
+		if (rank_prefilter) {
+			rank_prefilter = CreatePrefilter(context, gstate);
+		}
+	}
+
+private:
+	static unique_ptr<WindowRankPrefilter> CreatePrefilter(ExecutionContext &context,
+	                                                       const WindowGlobalSinkState &gstate) {
+		auto &op = gstate.op;
+		auto &wexpr = op.select_list[op.order_idx]->Cast<BoundWindowExpression>();
+		return make_uniq<WindowRankPrefilter>(context.client, wexpr, op.partition_limit.GetIndex());
 	}
 };
 
@@ -377,10 +544,22 @@ SinkNextBatchType PhysicalWindow::NextBatch(ExecutionContext &context, OperatorS
 SinkResultType PhysicalWindow::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &sink) const {
 	auto &gstate = sink.global_state.Cast<WindowGlobalSinkState>();
 	auto &lstate = sink.local_state.Cast<WindowLocalSinkState>();
-	gstate.count += chunk.size();
+
+	reference<DataChunk> input(chunk);
+	if (lstate.rank_prefilter) {
+		const auto kept = lstate.rank_prefilter->Select(chunk, lstate.prefilter_sel);
+		if (kept == 0) {
+			return SinkResultType::NEED_MORE_INPUT;
+		}
+		if (kept < chunk.size()) {
+			lstate.prefiltered.Slice(chunk, lstate.prefilter_sel, kept);
+			input = lstate.prefiltered;
+		}
+	}
+	gstate.count += input.get().size();
 
 	OperatorSinkInput hsink {*gstate.strategy_sink, *lstate.local_group, sink.interrupt_state};
-	return gstate.sort_strategy->Sink(context, chunk, hsink);
+	return gstate.sort_strategy->Sink(context, input.get(), hsink);
 }
 
 //===--------------------------------------------------------------------===//
@@ -1259,6 +1438,9 @@ InsertionOrderPreservingMap<string> PhysicalWindow::ParamsToString() const {
 		projections += select_list[i]->GetName();
 	}
 	result["Projections"] = projections;
+	if (partition_limit.IsValid()) {
+		result["Rank Limit"] = to_string(partition_limit.GetIndex());
+	}
 	SetEstimatedCardinality(result, estimated_cardinality);
 	return result;
 }

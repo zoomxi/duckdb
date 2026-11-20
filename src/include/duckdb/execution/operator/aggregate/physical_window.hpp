@@ -39,6 +39,8 @@ public:
 	unique_ptr<Expression> partition_distinct_from;
 	//! DISTINCT FROM comparison of the order keys of every window expression, by the end of its order key prefix
 	unordered_map<idx_t, unique_ptr<Expression>> order_distinct_from;
+	//! Rows that rank() places past this bound may be dropped before sorting
+	optional_idx partition_limit;
 
 public:
 	// Source interface

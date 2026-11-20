@@ -22,6 +22,9 @@ public:
 
 	unique_ptr<LogicalOperator> Optimize(unique_ptr<LogicalOperator> op);
 
+	//! The largest rank() bound that the sorted window prefilters for
+	static constexpr idx_t MAX_RANK_LIMIT = 1000;
+
 	static optional_idx CanOptimize(LogicalOperator &op);
 
 private:

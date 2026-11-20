@@ -133,13 +133,31 @@ optional_idx WindowFusion::CanOptimize(LogicalOperator &op) {
 			}
 		}
 	}
-	if (window.expressions[0]->GetExpressionType() != ExpressionType::WINDOW_ROW_NUMBER) {
-		return cant_optimize;
-	}
 	auto &window_expr = window.expressions[0]->Cast<BoundWindowExpression>();
-
 	if (!window_expr.ArgOrders().empty()) {
 		return cant_optimize;
+	}
+	switch (window_expr.GetExpressionType()) {
+	case ExpressionType::WINDOW_ROW_NUMBER:
+		return can_optimize;
+	case ExpressionType::WINDOW_RANK:
+		break;
+	default:
+		return cant_optimize;
+	}
+
+	//	The sorted window keeps a heap of the best rank_limit order keys per partition
+	const auto rank_limit = can_optimize.GetIndex();
+	if (rank_limit == 0 || rank_limit > MAX_RANK_LIMIT || window_expr.OrderBy().empty()) {
+		return cant_optimize;
+	}
+	for (auto &order : window_expr.OrderBy()) {
+		if (order.type != OrderType::ASCENDING && order.type != OrderType::DESCENDING) {
+			return cant_optimize;
+		}
+		if (order.null_order != OrderByNullType::NULLS_FIRST && order.null_order != OrderByNullType::NULLS_LAST) {
+			return cant_optimize;
+		}
 	}
 
 	return can_optimize;
@@ -170,8 +188,9 @@ unique_ptr<LogicalOperator> WindowFusion::OptimizeInternal(unique_ptr<LogicalOpe
 	auto &window = child.get().Cast<LogicalWindow>();
 	auto &wexpr = window.expressions[0]->Cast<BoundWindowExpression>();
 
-	// Restrict to implemented cases
-	if (!PhysicalStreamingWindow::IsStreamingFunction(client, wexpr)) {
+	//	row_number() is limited by the streaming window, rank() by the sorted window
+	if (wexpr.GetExpressionType() == ExpressionType::WINDOW_ROW_NUMBER &&
+	    !PhysicalStreamingWindow::IsStreamingFunction(client, wexpr)) {
 		return op;
 	}
 

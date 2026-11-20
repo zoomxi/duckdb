@@ -246,6 +246,13 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalWindow &op) {
 
 	// 	Streaming takes priority over partitioning
 	const bool has_streaming = !streaming_windows.empty();
+
+	//	A bounded rank() is prefiltered by the sorted window; streaming it would cut its ties
+	optional_idx rank_limit;
+	if (op.partition_limit.IsValid() && op.expressions[0]->GetExpressionType() == ExpressionType::WINDOW_RANK) {
+		rank_limit = op.partition_limit;
+	}
+	D_ASSERT(!rank_limit.IsValid() || !has_streaming);
 	if (has_streaming) {
 		for (auto &expr_idx : partitioned_windows) {
 			blocking_windows.emplace_back(expr_idx);
@@ -346,6 +353,8 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalWindow &op) {
 		window_expressions.emplace_back(std::move(matching));
 	}
 
+	D_ASSERT(!rank_limit.IsValid() || window_expressions.size() == 1);
+
 	// Build the window operators
 	for (idx_t i = 0; i < window_expressions.size(); ++i) {
 		// Extract the matching expressions
@@ -359,6 +368,7 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalWindow &op) {
 		// Chain the new window operator on top of the plan
 		if (i >= special_count) {
 			auto &window = Make<PhysicalWindow>(context, types, std::move(select_list), op.estimated_cardinality);
+			window.Cast<PhysicalWindow>().partition_limit = rank_limit;
 			window.children.push_back(plan);
 			plan = window;
 		} else if (has_streaming) {
@@ -371,6 +381,7 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalWindow &op) {
 			auto &partitions = partitioned_columns[expr_idx];
 			auto &window = Make<PhysicalWindow>(context, types, std::move(select_list), op.estimated_cardinality,
 			                                    std::move(partitions));
+			window.Cast<PhysicalWindow>().partition_limit = rank_limit;
 			window.children.push_back(plan);
 			plan = window;
 		}

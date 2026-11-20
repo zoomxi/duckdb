@@ -29,7 +29,7 @@ public:
 
 	TableIndex window_index;
 
-	//! The maximum number of rows to return per partition
+	//! Rows ranked past this bound may be dropped early; the filter above the window still applies
 	optional_idx partition_limit;
 
 public:
