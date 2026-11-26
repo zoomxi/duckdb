@@ -62,7 +62,8 @@ idx_t RelationStatisticsHelper::CardinalityFromDouble(double cardinality) {
 
 static bool MatchesTargetColumn(const Expression &expression, optional<ColumnBinding> target_binding) {
 	if (expression.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
-		return !target_binding || expression.Cast<BoundColumnRefExpression>().Binding() == *target_binding;
+		auto &ref = expression.Cast<BoundColumnRefExpression>();
+		return ref.Depth() == 0 && (!target_binding || ref.Binding() == *target_binding);
 	}
 	return !target_binding && expression.GetExpressionClass() == ExpressionClass::BOUND_REF;
 }
@@ -72,7 +73,8 @@ optional_idx RelationStatisticsHelper::EstimateDirectFilterDomain(const Expressi
                                                                   idx_t maximum_domain) {
 	if (BoundComparisonExpression::IsComparison(expression)) {
 		auto &comparison = expression.Cast<BoundFunctionExpression>();
-		if (comparison.GetExpressionType() != ExpressionType::COMPARE_EQUAL) {
+		auto type = comparison.GetExpressionType();
+		if (type != ExpressionType::COMPARE_EQUAL && type != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
 			return {};
 		}
 		auto &left = BoundComparisonExpression::Left(comparison);
@@ -83,11 +85,13 @@ optional_idx RelationStatisticsHelper::EstimateDirectFilterDomain(const Expressi
 		} else if (MatchesTargetColumn(right, target_binding)) {
 			constant = left;
 		}
-		if (constant && constant->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT &&
-		    !constant->Cast<BoundConstantExpression>().GetValue().IsNull()) {
-			return optional_idx(MinValue<idx_t>(maximum_domain, 1));
+		if (!constant || constant->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+			return {};
 		}
-		return {};
+		if (constant->Cast<BoundConstantExpression>().GetValue().IsNull()) {
+			return type == ExpressionType::COMPARE_EQUAL ? optional_idx(0) : optional_idx();
+		}
+		return optional_idx(MinValue<idx_t>(maximum_domain, 1));
 	}
 
 	if (expression.GetExpressionType() == ExpressionType::COMPARE_IN &&

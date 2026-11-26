@@ -5,7 +5,8 @@ add_library_unity(
   relation_statistics_extractor.cpp
   relation_statistics_helper.cpp
   relation_statistics_operator.cpp
-  relation_statistics_scan.cpp)
+  relation_statistics_scan.cpp
+  residual_filter_selectivity.cpp)
 
 set(ALL_OBJECT_FILES
     ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:duckdb_optimizer_relation_statistics>

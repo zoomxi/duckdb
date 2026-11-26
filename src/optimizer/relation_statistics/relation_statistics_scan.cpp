@@ -199,6 +199,18 @@ public:
 		return Hugeint::Cast<double>(matching) / Hugeint::Cast<double>(count);
 	}
 
+	optional_idx DomainBound() const {
+		if (!has_bounds) {
+			return {};
+		}
+		auto matching = MaxValue(hugeint_t(0), upper - lower + 1);
+		uint64_t bound;
+		if (!Hugeint::TryCast(matching, bound)) {
+			return {};
+		}
+		return optional_idx(bound);
+	}
+
 private:
 	const BaseStatistics &statistics;
 	hugeint_t lower;
@@ -549,6 +561,7 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientC
 	}
 	RelationColumnStatsLookup columns(result);
 	FilterEstimate estimate {base_table_cardinality, true};
+	vector<optional_idx> range_domain_caps(result.columns.size());
 	for (auto &entry : get.table_filters) {
 		auto &filter = ExpressionFilter::GetExpressionFilter(entry.Filter(), "ExtractGetStats");
 		vector<ColumnBinding> bindings {ColumnBinding(get.table_index, entry.GetIndex())};
@@ -564,6 +577,13 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientC
 			    *fraction == 0 ? CardinalityValue(0)
 			                   : FilterFraction(base_table_cardinality, MaxValue(DEFAULT_SELECTIVITY, *fraction));
 			estimate.Combine({range_cardinality, true, *fraction == 0});
+			if (!ExpressionFilter::IsOptionalFilter(entry.Filter())) {
+				auto domain_bound = range.DomainBound();
+				if (domain_bound.IsValid()) {
+					auto &cap = range_domain_caps[entry.GetIndex().GetIndex()];
+					cap = cap.IsValid() ? MinValue(cap.GetIndex(), domain_bound.GetIndex()) : domain_bound;
+				}
+			}
 		}
 	}
 	if (get.table_filters.HasFilters()) {
@@ -581,7 +601,13 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientC
 		}
 	}
 	ApplyFilterEstimate(result, estimate);
-	for (auto &column : result.columns) {
+	for (idx_t col_idx = 0; col_idx < result.columns.size(); col_idx++) {
+		auto &column = result.columns[col_idx];
+		if (range_domain_caps[col_idx].IsValid()) {
+			column.current_domain = DistinctCount(
+			    MinValue(column.current_domain.distinct_count, CardinalityValue(range_domain_caps[col_idx].GetIndex())),
+			    DistinctCountSource::CARDINALITY);
+		}
 		for (auto &entry : get.table_filters) {
 			if (ExpressionFilter::IsOptionalFilter(entry.Filter()) || entry.GetIndex() != column.binding.column_index) {
 				continue;

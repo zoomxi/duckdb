@@ -3764,3 +3764,340 @@ TEST_CASE("Selected aggregate domain propagation falls back without a proven sou
 	}
 	connection.Rollback();
 }
+
+static unique_ptr<Expression> CreateConstantComparison(ColumnBinding column, int32_t value) {
+	return BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL,
+	                                         make_uniq<BoundColumnRefExpression>(LogicalType::INTEGER, column),
+	                                         make_uniq<BoundConstantExpression>(Value::INTEGER(value)));
+}
+
+TEST_CASE("Residual filter selectivity handles boolean structures and safety bounds",
+          "[optimizer][relation_statistics]") {
+	auto estimate_inner_list = [&](vector<unique_ptr<Expression>> residual_exprs, const vector<RelationStats> &stats,
+	                               bool single_relation = false) {
+		JoinRelationSetManager sets;
+		auto &a = sets.GetJoinRelation(RelationIndex(0));
+		auto &b = sets.GetJoinRelation(RelationIndex(1));
+		auto &ab = sets.Union(a, b);
+		JoinPredicateModel model;
+		vector<unique_ptr<FilterInfo>> residual_infos;
+		for (idx_t i = 0; i < residual_exprs.size(); i++) {
+			auto info = make_uniq<FilterInfo>(std::move(residual_exprs[i]), single_relation ? a : ab, i);
+			info->from_residual_predicate = true;
+			if (single_relation) {
+				info->source_operator_index = optional_idx(0);
+			}
+			model.RegisterPredicate(*info, JoinPredicateClass::OTHER, ColumnBinding(), ColumnBinding());
+			residual_infos.push_back(std::move(info));
+		}
+		vector<unique_ptr<JoinOrderOperator>> operators;
+		if (single_relation) {
+			AddOperator(operators, sets, a, b, JoinOrderOperatorType::INNER);
+		}
+		CardinalityEstimator estimator(sets, model);
+		estimator.Initialize(stats, operators);
+		return estimator.EstimateCardinality(ab).GetDouble();
+	};
+	auto estimate_inner = [&](unique_ptr<Expression> residual_expr, const vector<RelationStats> &stats,
+	                          bool single_relation = false) {
+		vector<unique_ptr<Expression>> list;
+		list.push_back(std::move(residual_expr));
+		return estimate_inner_list(std::move(list), stats, single_relation);
+	};
+	auto make_and = [](unique_ptr<Expression> l, unique_ptr<Expression> r) {
+		return make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(l), std::move(r));
+	};
+	auto make_or = [](unique_ptr<Expression> l, unique_ptr<Expression> r) {
+		return make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_OR, std::move(l), std::move(r));
+	};
+	auto make_bool = [](bool v) {
+		return make_uniq<BoundConstantExpression>(Value::BOOLEAN(v));
+	};
+
+	auto x0 = ColumnBinding(TableIndex(0), ProjectionIndex(0));
+	auto y0 = ColumnBinding(TableIndex(0), ProjectionIndex(1));
+	auto z0 = ColumnBinding(TableIndex(0), ProjectionIndex(2));
+	auto k1 = ColumnBinding(TableIndex(1), ProjectionIndex(0));
+	auto x1 = ColumnBinding(TableIndex(1), ProjectionIndex(1));
+	// Base cross-product cardinality: 100 * 100 = 10000.
+	vector<RelationStats> stats {CreateStats({x0, y0, z0}, {20, 20, 20}, 100), CreateStats({k1, x1}, {100, 10}, 100)};
+
+	// 1) Non-OR owned INNER residual: 10000 * (1/20) = 500.
+	REQUIRE(estimate_inner(CreateConstantComparison(x0, 1), stats, true) == Approx(500.0));
+
+	// 2) Disjoint CNF: (x0 = 1 OR x1 = 1) AND y0 = 1 -> 10000 * (1/20 + 1/10) * (1/20) = 75.
+	REQUIRE(estimate_inner(make_and(make_or(CreateConstantComparison(x0, 1), CreateConstantComparison(x1, 1)),
+	                                CreateConstantComparison(y0, 1)),
+	                       stats) == Approx(75.0));
+
+	// 3) Overlapping ORs in AND fall back to 0.2 instead of multiplying shared evidence: 10000 * 0.2 = 2000.
+	REQUIRE(estimate_inner(make_and(make_or(CreateConstantComparison(x0, 1), CreateConstantComparison(k1, 1)),
+	                                make_or(CreateConstantComparison(x0, 1), CreateConstantComparison(k1, 2))),
+	                       stats) == Approx(2000.0));
+
+	// Separate residual filters sharing evidence columns also fall back: 10000 * 0.2 * 0.2 = 400.
+	vector<unique_ptr<Expression>> separate_overlapping;
+	separate_overlapping.push_back(make_or(CreateConstantComparison(x0, 1), CreateConstantComparison(k1, 1)));
+	separate_overlapping.push_back(make_or(CreateConstantComparison(x0, 1), CreateConstantComparison(k1, 2)));
+	REQUIRE(estimate_inner_list(std::move(separate_overlapping), stats) == Approx(400.0));
+
+	// Direct column overlapping with a nested OR falls back regardless of operand order: 10000 * 0.2 = 2000.
+	REQUIRE(estimate_inner(make_and(CreateConstantComparison(x0, 1),
+	                                make_or(CreateConstantComparison(x0, 1), CreateConstantComparison(k1, 1))),
+	                       stats) == Approx(2000.0));
+	REQUIRE(estimate_inner(make_and(make_or(CreateConstantComparison(x0, 1), CreateConstantComparison(k1, 1)),
+	                                CreateConstantComparison(x0, 1)),
+	                       stats) == Approx(2000.0));
+
+	// 4) Same-relation correlated columns are floored at 1 / relation_cardinality: (1/20)^3 -> 1/100 -> 100.
+	auto correlated = make_and(make_and(CreateConstantComparison(x0, 1), CreateConstantComparison(y0, 2)),
+	                           CreateConstantComparison(z0, 3));
+	REQUIRE(estimate_inner(std::move(correlated), stats) == Approx(100.0));
+
+	// 5) Duplicate OR branches use a conservative union bound: 10000 * (2 * 1/20 * 1/10) = 100.
+	REQUIRE(estimate_inner(make_or(make_and(CreateConstantComparison(x0, 1), CreateConstantComparison(x1, 1)),
+	                               make_and(CreateConstantComparison(x0, 1), CreateConstantComparison(x1, 1))),
+	                       stats) == Approx(100.0));
+
+	// 6) Folded NULL::BOOLEAN disjunct is skipped without collapsing the surviving branch; full-domain falls back.
+	REQUIRE(estimate_inner(make_or(make_and(CreateConstantComparison(x0, 1), make_bool(true)),
+	                               make_and(make_uniq<BoundConstantExpression>(Value(LogicalType::BOOLEAN)),
+	                                        CreateConstantComparison(x1, 1))),
+	                       stats) == Approx(500.0));
+	vector<RelationStats> full_domain_stats {CreateStats({x0}, {1}, 100), CreateStats({x1}, {10}, 100)};
+	REQUIRE(estimate_inner(CreateConstantComparison(x0, 1), full_domain_stats, true) == Approx(2000.0));
+
+	// 7) Alternating AND/OR nesting is evaluated up to MAX_RESIDUAL_DEPTH and falls back safely beyond it.
+	auto make_alternating = [&](idx_t depth_limit) {
+		unique_ptr<Expression> expr = CreateConstantComparison(x0, 1);
+		for (idx_t d = 0; d < depth_limit; d++) {
+			expr =
+			    (d % 2 == 0) ? make_and(std::move(expr), make_bool(true)) : make_or(std::move(expr), make_bool(false));
+		}
+		return expr;
+	};
+	REQUIRE(estimate_inner(make_alternating(10), stats) == Approx(500.0));
+	REQUIRE(estimate_inner(make_alternating(40), stats) == Approx(2000.0));
+
+	// 8) Equivalent join keys (a.k = b.k) are canonicalized in both AND deduplication and cross-filter overlap.
+	auto estimate_with_eq = [&](vector<unique_ptr<Expression>> residual_exprs) {
+		JoinRelationSetManager sets;
+		auto &a = sets.GetJoinRelation(RelationIndex(0));
+		auto &b = sets.GetJoinRelation(RelationIndex(1));
+		auto &ab = sets.Union(a, b);
+		auto ak = ColumnBinding(TableIndex(0), ProjectionIndex(0));
+		auto ax = ColumnBinding(TableIndex(0), ProjectionIndex(1));
+		auto bk = ColumnBinding(TableIndex(1), ProjectionIndex(0));
+		auto by = ColumnBinding(TableIndex(1), ProjectionIndex(1));
+		FilterInfo eq(CreateJoinComparison(ak, bk, ExpressionType::COMPARE_EQUAL), ab, 0);
+		eq.SetLeftSet(a);
+		eq.SetRightSet(b);
+		eq.left_binding = ak;
+		eq.right_binding = bk;
+		JoinPredicateModel model;
+		auto &pred = model.RegisterPredicate(eq, JoinPredicateClass::INNER_EQUALITY, ak, bk);
+		pred.SetEqualityClassIndex(optional_idx(0));
+		JoinEqualityClass eq_class;
+		eq_class.index = 0;
+		eq_class.columns = {ak, bk};
+		eq_class.relations = {RelationIndex(0), RelationIndex(1)};
+		eq_class.edges.emplace_back(pred, RelationIndex(0), RelationIndex(1), ak, bk);
+		model.AddEqualityClass(std::move(eq_class));
+		vector<unique_ptr<FilterInfo>> residual_infos;
+		for (idx_t i = 0; i < residual_exprs.size(); i++) {
+			auto info = make_uniq<FilterInfo>(std::move(residual_exprs[i]), ab, i + 1);
+			info->from_residual_predicate = true;
+			model.RegisterPredicate(*info, JoinPredicateClass::OTHER, ColumnBinding(), ColumnBinding());
+			residual_infos.push_back(std::move(info));
+		}
+		CardinalityEstimator estimator(sets, model);
+		// Base join cardinality: 1000 * 1000 / 100 = 10000.
+		estimator.Initialize({CreateStats({ak, ax}, {100, 100}, 1000), CreateStats({bk, by}, {100, 100}, 1000)});
+		return estimator.EstimateCardinality(ab).GetDouble();
+	};
+	auto ak = ColumnBinding(TableIndex(0), ProjectionIndex(0));
+	auto ax = ColumnBinding(TableIndex(0), ProjectionIndex(1));
+	auto bk = ColumnBinding(TableIndex(1), ProjectionIndex(0));
+	auto by = ColumnBinding(TableIndex(1), ProjectionIndex(1));
+	// (a.k = 1 AND b.k = 1) deduplicates on the equivalence class: 10000 * (1/100) = 100 (not 1).
+	vector<unique_ptr<Expression>> eq_and;
+	eq_and.push_back(make_and(CreateConstantComparison(ak, 1), CreateConstantComparison(bk, 1)));
+	REQUIRE(estimate_with_eq(std::move(eq_and)) == Approx(100.0));
+	// Separate ORs sharing equivalent keys (a.k = 1 OR a.x = 1) AND (b.k = 1 OR b.y = 2) fall back: 10000 * 0.04 = 400.
+	vector<unique_ptr<Expression>> eq_overlap;
+	eq_overlap.push_back(make_or(CreateConstantComparison(ak, 1), CreateConstantComparison(ax, 1)));
+	eq_overlap.push_back(make_or(CreateConstantComparison(bk, 1), CreateConstantComparison(by, 2)));
+	REQUIRE(estimate_with_eq(std::move(eq_overlap)) == Approx(400.0));
+
+	// 9) Constant residuals preserve exact 0/1 bounds, fractional domains stay exact, and leaf filters tighten domains.
+	REQUIRE(estimate_inner(make_bool(true), stats) == Approx(10000.0));
+	REQUIRE(estimate_inner(make_bool(false), stats) == Approx(0.0));
+	{
+		auto frac_stats = stats;
+		frac_stats[0].cardinality = CardinalityValue(10.5);
+		frac_stats[0].columns[0].current_domain = DistinctCount(CardinalityValue(10.5), DistinctCountSource::EXACT);
+		// 10.5 * 100 * (1 / 10.5) = 100.
+		REQUIRE(estimate_inner(CreateConstantComparison(x0, 1), frac_stats, true) == Approx(100.0));
+	}
+	{
+		JoinRelationSetManager sets;
+		auto &a = sets.GetJoinRelation(RelationIndex(0));
+		auto &b = sets.GetJoinRelation(RelationIndex(1));
+		auto &ab = sets.Union(a, b);
+		auto c0 = ColumnBinding(TableIndex(10), ProjectionIndex(0));
+		auto c1 = ColumnBinding(TableIndex(20), ProjectionIndex(0));
+		// Single-input LogicalFilter c0 IN (1..10) tightens c0's current_domain from 100 to 10 before residual sizing.
+		auto in_expr = make_uniq<BoundOperatorExpression>(ExpressionType::COMPARE_IN, LogicalType::BOOLEAN);
+		in_expr->GetChildrenMutable().push_back(make_uniq<BoundColumnRefExpression>(LogicalType::INTEGER, c0));
+		for (int32_t v = 1; v <= 10; v++) {
+			in_expr->GetChildrenMutable().push_back(make_uniq<BoundConstantExpression>(Value::INTEGER(v)));
+		}
+		FilterInfo leaf_filter(std::move(in_expr), a, 0);
+		leaf_filter.from_logical_filter = true;
+		FilterInfo residual(make_or(CreateConstantComparison(c0, 1), CreateConstantComparison(c1, 1)), ab, 1);
+		residual.from_residual_predicate = true;
+		JoinPredicateModel model;
+		model.RegisterPredicate(leaf_filter, JoinPredicateClass::OTHER, ColumnBinding(), ColumnBinding());
+		model.RegisterPredicate(residual, JoinPredicateClass::OTHER, ColumnBinding(), ColumnBinding());
+		CardinalityEstimator estimator(sets, model);
+		estimator.Initialize({CreateStats({c0}, {100}, 1000), CreateStats({c1}, {100}, 1000)});
+		// Leaf a drops to 200 rows (default selectivity on IN) with current_domain = 10 -> (1/10 + 1/100) = 0.11.
+		REQUIRE(estimator.EstimateCardinality(ab).GetDouble() == Approx(200.0 * 1000.0 * 0.11));
+	}
+
+	// 10) Non-selective leaves (IS NOT NULL, !=, IS DISTINCT FROM) do not penalize selective conjuncts,
+	//     unfolded NULL comparisons mark branches impossible, and IS NOT DISTINCT FROM handles non-null constants.
+	auto make_is_not_null = [](ColumnBinding col) {
+		auto expr = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NOT_NULL, LogicalType::BOOLEAN);
+		expr->GetChildrenMutable().push_back(make_uniq<BoundColumnRefExpression>(LogicalType::INTEGER, col));
+		return expr;
+	};
+	auto make_cmp = [](ExpressionType type, ColumnBinding col, Value val) {
+		return BoundComparisonExpression::Create(type, make_uniq<BoundColumnRefExpression>(LogicalType::INTEGER, col),
+		                                         make_uniq<BoundConstantExpression>(std::move(val)));
+	};
+	// Selective + repeated IS NOT NULL / != / IS DISTINCT FROM retains 1/20 -> 500.
+	REQUIRE(
+	    estimate_inner(make_and(CreateConstantComparison(x0, 1), make_and(make_is_not_null(y0), make_is_not_null(z0))),
+	                   stats) == Approx(500.0));
+	REQUIRE(estimate_inner(make_and(CreateConstantComparison(x0, 1),
+	                                make_and(make_cmp(ExpressionType::COMPARE_NOTEQUAL, y0, Value::INTEGER(5)),
+	                                         make_cmp(ExpressionType::COMPARE_DISTINCT_FROM, z0, Value::INTEGER(7)))),
+	                       stats) == Approx(500.0));
+	// Non-selective leaves alone or as an unbounded OR disjunct retain DEFAULT_SELECTIVITY -> 2000.
+	REQUIRE(estimate_inner(make_is_not_null(y0), stats) == Approx(2000.0));
+	REQUIRE(estimate_inner(make_cmp(ExpressionType::COMPARE_NOTEQUAL, y0, Value::INTEGER(5)), stats) == Approx(2000.0));
+	REQUIRE(estimate_inner(make_or(CreateConstantComparison(x0, 1), make_is_not_null(y0)), stats) == Approx(2000.0));
+	// IS NOT DISTINCT FROM non-null uses domain (500); IS DISTINCT FROM NULL is passthrough (500);
+	// IS NOT DISTINCT FROM NULL falls back (100).
+	REQUIRE(estimate_inner(make_cmp(ExpressionType::COMPARE_NOT_DISTINCT_FROM, x0, Value::INTEGER(5)), stats) ==
+	        Approx(500.0));
+	REQUIRE(estimate_inner(make_and(CreateConstantComparison(x0, 1),
+	                                make_cmp(ExpressionType::COMPARE_DISTINCT_FROM, y0, Value(LogicalType::INTEGER))),
+	                       stats) == Approx(500.0));
+	REQUIRE(estimate_inner(make_and(CreateConstantComparison(x0, 1), make_cmp(ExpressionType::COMPARE_NOT_DISTINCT_FROM,
+	                                                                          y0, Value(LogicalType::INTEGER))),
+	                       stats) == Approx(100.0));
+	// Unfolded col = NULL skips the dead disjunct without collapsing siblings: 10000 * (1/20 * 1/10) = 50.
+	REQUIRE(estimate_inner(make_or(make_and(CreateConstantComparison(x0, 1), CreateConstantComparison(x1, 1)),
+	                               make_and(make_cmp(ExpressionType::COMPARE_EQUAL, x0, Value(LogicalType::INTEGER)),
+	                                        CreateConstantComparison(x1, 2))),
+	                       stats) == Approx(50.0));
+	// All-impossible unfolded NULL residual proves empty -> 0.
+	REQUIRE(estimate_inner(make_or(make_and(make_cmp(ExpressionType::COMPARE_EQUAL, x0, Value(LogicalType::INTEGER)),
+	                                        CreateConstantComparison(x1, 1)),
+	                               make_and(make_cmp(ExpressionType::COMPARE_LESSTHAN, y0, Value(LogicalType::INTEGER)),
+	                                        CreateConstantComparison(x1, 2))),
+	                       stats) == Approx(0.0));
+
+	// 11) Shared EstimateDirectFilterDomain handles col = NULL, IS NOT DISTINCT FROM, and correlated depth > 0.
+	auto eq_null = make_cmp(ExpressionType::COMPARE_EQUAL, x0, Value(LogicalType::INTEGER));
+	REQUIRE(RelationStatisticsHelper::EstimateDirectFilterDomain(*eq_null, x0, 100) == optional_idx(0));
+	auto ndf_val = make_cmp(ExpressionType::COMPARE_NOT_DISTINCT_FROM, x0, Value::INTEGER(5));
+	REQUIRE(RelationStatisticsHelper::EstimateDirectFilterDomain(*ndf_val, x0, 100) == optional_idx(1));
+	auto ndf_null = make_cmp(ExpressionType::COMPARE_NOT_DISTINCT_FROM, x0, Value(LogicalType::INTEGER));
+	REQUIRE_FALSE(RelationStatisticsHelper::EstimateDirectFilterDomain(*ndf_null, x0, 100).IsValid());
+	auto correlated_eq = BoundComparisonExpression::Create(
+	    ExpressionType::COMPARE_EQUAL, make_uniq<BoundColumnRefExpression>(LogicalType::INTEGER, x0, 1),
+	    make_uniq<BoundConstantExpression>(Value::INTEGER(5)));
+	REQUIRE_FALSE(RelationStatisticsHelper::EstimateDirectFilterDomain(*correlated_eq, x0, 100).IsValid());
+}
+
+TEST_CASE("LEFT JOIN ON residual predicates use domain selectivity and overlap guards",
+          "[optimizer][relation_statistics]") {
+	auto lk = ColumnBinding(TableIndex(0), ProjectionIndex(0));
+	auto la = ColumnBinding(TableIndex(0), ProjectionIndex(1));
+	auto rk = ColumnBinding(TableIndex(1), ProjectionIndex(0));
+	auto rc = ColumnBinding(TableIndex(1), ProjectionIndex(1));
+	auto rd = ColumnBinding(TableIndex(1), ProjectionIndex(2));
+	// Base LEFT match cardinality: 100 * 100000 / 100 = 100000; preserved left rows = 100.
+	vector<RelationStats> stats {CreateStats({lk, la}, {100, 20}, 100),
+	                             CreateStats({rk, rc, rd}, {100, 20, 10}, 100000)};
+
+	auto estimate_left = [&](vector<unique_ptr<Expression>> residuals) {
+		JoinRelationSetManager sets;
+		auto &left = sets.GetJoinRelation(RelationIndex(0));
+		auto &right = sets.GetJoinRelation(RelationIndex(1));
+		auto &root = sets.Union(left, right);
+		FilterInfo equality(CreateJoinComparison(lk, rk, ExpressionType::COMPARE_EQUAL), root, 0, JoinType::LEFT);
+		equality.SetLeftSet(left);
+		equality.SetRightSet(right);
+		equality.left_binding = lk;
+		equality.right_binding = rk;
+		equality.source_operator_index = optional_idx(0);
+		JoinPredicateModel model;
+		model.RegisterPredicate(equality, JoinPredicateClass::LEFT_JOIN, lk, rk);
+		vector<unique_ptr<JoinOrderOperator>> operators;
+		auto &op = AddOperator(operators, sets, left, right, JoinOrderOperatorType::LEFT);
+		for (auto &expr : residuals) {
+			op.conditions.emplace_back(std::move(expr));
+			op.residual_predicates.push_back(op.conditions.back().GetJoinExpression());
+		}
+		CardinalityEstimator estimator(sets, model);
+		estimator.Initialize(stats, operators);
+		return estimator.EstimateCardinality(root).GetDouble();
+	};
+	auto estimate_left_one = [&](unique_ptr<Expression> expr) {
+		vector<unique_ptr<Expression>> list;
+		list.push_back(std::move(expr));
+		return estimate_left(std::move(list));
+	};
+	auto make_and = [](unique_ptr<Expression> l, unique_ptr<Expression> r) {
+		return make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(l), std::move(r));
+	};
+	auto make_or = [](unique_ptr<Expression> l, unique_ptr<Expression> r) {
+		return make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_OR, std::move(l), std::move(r));
+	};
+	auto make_is_not_null = [](ColumnBinding col) {
+		auto expr = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NOT_NULL, LogicalType::BOOLEAN);
+		expr->GetChildrenMutable().push_back(make_uniq<BoundColumnRefExpression>(LogicalType::INTEGER, col));
+		return expr;
+	};
+	auto make_cmp = [](ExpressionType type, ColumnBinding col, Value val) {
+		return BoundComparisonExpression::Create(type, make_uniq<BoundColumnRefExpression>(LogicalType::INTEGER, col),
+		                                         make_uniq<BoundConstantExpression>(std::move(val)));
+	};
+
+	// Exact constants: TRUE -> 100000, FALSE -> preserved left rows (100).
+	REQUIRE(estimate_left_one(make_uniq<BoundConstantExpression>(Value::BOOLEAN(true))) == Approx(100000.0));
+	REQUIRE(estimate_left_one(make_uniq<BoundConstantExpression>(Value::BOOLEAN(false))) == Approx(100.0));
+	// Selective single predicate: 100000 * (1/20) = 5000.
+	REQUIRE(estimate_left_one(CreateConstantComparison(rc, 1)) == Approx(5000.0));
+	// Selective multi-column OR: 100000 * (1/20 * 1/10 + 1/20 * 1/10) = 1000.
+	REQUIRE(estimate_left_one(make_or(make_and(CreateConstantComparison(rc, 1), CreateConstantComparison(rd, 1)),
+	                                  make_and(CreateConstantComparison(rc, 2), CreateConstantComparison(rd, 2)))) ==
+	        Approx(1000.0));
+	// Non-selective IS NOT NULL / != alongside selective predicates do not add 0.2 penalty: 100000 * (2/20) = 10000.
+	auto left_non_selective = make_or(
+	    make_and(CreateConstantComparison(rc, 1), make_is_not_null(rd)),
+	    make_and(CreateConstantComparison(rc, 2), make_cmp(ExpressionType::COMPARE_NOTEQUAL, rd, Value::INTEGER(9))));
+	REQUIRE(estimate_left_one(std::move(left_non_selective)) == Approx(10000.0));
+	// Non-constant impossible ON predicate collapses match cardinality to 0 -> preserved left rows (100).
+	REQUIRE(estimate_left_one(make_cmp(ExpressionType::COMPARE_EQUAL, rc, Value(LogicalType::INTEGER))) ==
+	        Approx(100.0));
+	// Overlapping residual ON predicates share l.a -> fall back to 0.2 * 0.2 -> 100000 * 0.04 = 4000.
+	vector<unique_ptr<Expression>> overlapping;
+	overlapping.push_back(make_or(CreateConstantComparison(la, 1), CreateConstantComparison(rc, 1)));
+	overlapping.push_back(make_or(CreateConstantComparison(la, 1), CreateConstantComparison(rd, 1)));
+	REQUIRE(estimate_left(std::move(overlapping)) == Approx(4000.0));
+}

@@ -109,6 +109,7 @@
         "test/optimizer/joins/not_equal_join_cardinality_estimation.test",
         "test/optimizer/joins/integer_range_selectivity_floor.test",
         "test/optimizer/joins/range_join_cardinality_estimation.test",
+        "test/optimizer/joins/residual_or_join_selectivity.test",
         "test/optimizer/joins/unsupported_conjunct_selectivity.test",
         "test/optimizer/projection_pullup_nested_plan.test",
         "test/optimizer/statistics/current_domain_cardinality.test",

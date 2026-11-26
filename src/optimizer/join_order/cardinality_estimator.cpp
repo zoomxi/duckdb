@@ -3,6 +3,7 @@
 #include "duckdb/common/set.hpp"
 #include "duckdb/optimizer/join_order/join_order_operator.hpp"
 #include "duckdb/optimizer/join_order/join_predicate.hpp"
+#include "duckdb/optimizer/relation_statistics/residual_filter_selectivity.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
@@ -218,8 +219,6 @@ struct ResidualFilterStats {
 	bool proven_empty;
 };
 
-static CardinalityValue GetResidualOnSelectivity(const Expression &expression);
-
 struct CardinalityEstimatorState {
 	void InitializeEdgeIndex();
 	bool TryGetCandidateEdges(const JoinRelationSet &set, vector<idx_t> &candidates) const;
@@ -237,6 +236,7 @@ struct CardinalityEstimatorState {
 	//! Only requested columns at semantic boundaries; inner subsets do not acquire full column vectors.
 	reference_map_t<JoinRelationSet, column_binding_map_t<RelationColumnStats>> projected_columns;
 	vector<ResidualFilterStats> residual_filters;
+	unordered_map<idx_t, CardinalityValue> left_residual_selectivities;
 	unordered_set<idx_t> leaf_filters;
 };
 
@@ -375,9 +375,8 @@ void CardinalityEstimator::InitEquivalentRelations() {
 			continue;
 		}
 		if (predicate_ref.get().IsResidualFilter()) {
-			auto selectivity = GetResidualOnSelectivity(*filter.filter);
-			auto constant = filter.filter->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT;
-			state->residual_filters.push_back({filter, selectivity, constant && selectivity.IsZero()});
+			state->residual_filters.push_back(
+			    {filter, CardinalityValue(RelationStatisticsHelper::DEFAULT_SELECTIVITY), false});
 			continue;
 		}
 		if (SingleColumnFilter(filter)) {
@@ -1184,12 +1183,60 @@ optional<RelationStats> CardinalityEstimator::ProjectStats(JoinRelationSet &set,
 	return result;
 }
 
-static CardinalityValue GetResidualOnSelectivity(const Expression &expression) {
-	if (expression.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
-		auto &value = expression.Cast<BoundConstantExpression>().GetValue();
-		return CardinalityValue(!value.IsNull() && value.GetValue<bool>() ? 1 : 0);
+static void EstimateResidualSelectivities(CardinalityEstimatorState &state,
+                                          const vector<unique_ptr<JoinOrderOperator>> &operators,
+                                          const JoinPredicateModel &predicate_model) {
+	bool has_left_residuals = false;
+	for (auto &op : operators) {
+		if (op->type == JoinOrderOperatorType::LEFT && !op->residual_predicates.empty()) {
+			has_left_residuals = true;
+			break;
+		}
 	}
-	return CardinalityValue(RelationStatisticsHelper::DEFAULT_SELECTIVITY);
+	if (state.residual_filters.empty() && !has_left_residuals) {
+		return;
+	}
+	column_binding_map_t<ColumnBinding> equivalence_roots;
+	for (auto &eq_class : predicate_model.GetEqualityClasses()) {
+		if (eq_class.columns.size() < 2) {
+			continue;
+		}
+		auto root = *eq_class.columns.begin();
+		for (auto &binding : eq_class.columns) {
+			equivalence_roots.emplace(binding, root);
+		}
+	}
+	ResidualFilterEstimator estimator(state.leaves, equivalence_roots);
+	if (!state.residual_filters.empty()) {
+		vector<optional_ptr<const Expression>> exprs;
+		exprs.reserve(state.residual_filters.size());
+		for (auto &residual : state.residual_filters) {
+			exprs.push_back(residual.filter.get().filter.get());
+		}
+		auto estimates = estimator.EstimateBatch(exprs);
+		for (idx_t i = 0; i < state.residual_filters.size(); i++) {
+			state.residual_filters[i].selectivity = estimates[i].selectivity;
+			state.residual_filters[i].proven_empty = estimates[i].proven_empty;
+		}
+	}
+	if (!has_left_residuals) {
+		return;
+	}
+	for (auto &op : operators) {
+		if (op->type != JoinOrderOperatorType::LEFT || op->residual_predicates.empty()) {
+			continue;
+		}
+		vector<optional_ptr<const Expression>> exprs;
+		exprs.reserve(op->residual_predicates.size());
+		for (auto &residual : op->residual_predicates) {
+			exprs.push_back(&residual.get());
+		}
+		CardinalityValue selectivity(1);
+		for (auto &estimate : estimator.EstimateBatch(exprs)) {
+			selectivity *= estimate.selectivity;
+		}
+		state.left_residual_selectivities.emplace(op->index, selectivity);
+	}
 }
 
 CardinalityValue CardinalityEstimator::GetLeftJoinSelectivity(const JoinOrderOperator &join_operator) {
@@ -1229,8 +1276,9 @@ CardinalityValue CardinalityEstimator::GetLeftJoinSelectivity(const JoinOrderOpe
 			selectivity *= CardinalityValue(RelationStatisticsHelper::DEFAULT_SELECTIVITY);
 		}
 	}
-	for (auto &residual : join_operator.residual_predicates) {
-		selectivity *= GetResidualOnSelectivity(residual);
+	auto residual = state->left_residual_selectivities.find(join_operator.index);
+	if (residual != state->left_residual_selectivities.end()) {
+		selectivity *= residual->second;
 	}
 	return selectivity;
 }
@@ -1286,6 +1334,7 @@ void CardinalityEstimator::Initialize(vector<RelationStats> relations,
 		leaf = RelationStatisticsHelper::ConditionFilterStats(leaf, entry.second, bindings);
 	}
 	InitEquivalentRelations();
+	EstimateResidualSelectivities(*state, operators, predicate_model);
 	for (idx_t i = 0; i < state->leaves.size(); i++) {
 		auto &stats = state->leaves[i];
 		D_ASSERT(stats.stats_initialized);

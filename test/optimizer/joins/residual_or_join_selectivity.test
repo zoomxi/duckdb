@@ -1,0 +1,348 @@
+# name: test/optimizer/joins/residual_or_join_selectivity.test
+# description: Residual filter selectivity (INNER and LEFT JOIN ON) uses conditional column domains and safe fallbacks
+# group: [joins]
+
+statement ok
+SET explain_output='optimized_only';
+
+# Q48-shaped schema:
+# - dim_cd: 35000 rows, 5 marital * 7 edu combinations (35 combos, 1000 rows each), unique cd_sk
+# - dim_ca: 10000 rows, 20 states * 2 countries (500 rows per state), unique ca_sk
+# - fact:   10000 rows referencing cd_sk and ca_sk
+statement ok
+CREATE TABLE dim_cd AS
+SELECT
+	i::INTEGER AS cd_sk,
+	('m' || (i % 5))::VARCHAR AS marital,
+	('e' || ((i // 5) % 7))::VARCHAR AS edu
+FROM range(35000) r(i);
+
+statement ok
+CREATE TABLE dim_ca AS
+SELECT
+	i::INTEGER AS ca_sk,
+	('c' || (i % 2))::VARCHAR AS country,
+	('s' || (i % 20))::VARCHAR AS state
+FROM range(10000) r(i);
+
+statement ok
+CREATE TABLE fact AS
+SELECT
+	i::INTEGER AS id,
+	(i % 35000)::INTEGER AS cd_sk,
+	(i % 10000)::INTEGER AS ca_sk,
+	(i % 200)::DOUBLE AS price,
+	(i % 500)::DOUBLE AS profit
+FROM range(10000) r(i);
+
+# 1) Q48-shaped join order regression: both dim_cd and dim_ca retain 20% at scan/filter level,
+#    but conditional domain selectivity gives dim_cd a much smaller join result so it joins fact first.
+query II
+EXPLAIN (FORMAT JSON)
+WITH cd_filtered AS MATERIALIZED (
+	SELECT cd_sk, marital, edu
+	FROM dim_cd
+	WHERE marital IN ('m0', 'm1', 'm2')
+	  AND edu IN ('e0', 'e1', 'e2')
+)
+SELECT count(*)
+FROM fact
+JOIN dim_ca ON fact.ca_sk = dim_ca.ca_sk
+JOIN cd_filtered ON fact.cd_sk = cd_filtered.cd_sk
+WHERE dim_ca.country = 'c0'
+  AND ((cd_filtered.marital = 'm0' AND cd_filtered.edu = 'e0' AND fact.price BETWEEN 100 AND 150)
+    OR (cd_filtered.marital = 'm1' AND cd_filtered.edu = 'e1' AND fact.price <= 50)
+    OR (cd_filtered.marital = 'm2' AND cd_filtered.edu = 'e2' AND fact.price >= 150))
+  AND ((dim_ca.state IN ('s0', 's2', 's4') AND fact.profit BETWEEN 0 AND 200)
+    OR (dim_ca.state IN ('s6', 's8', 's10') AND fact.profit BETWEEN 150 AND 300)
+    OR (dim_ca.state IN ('s12', 's14', 's16') AND fact.profit BETWEEN 50 AND 450));
+----
+logical_opt	<REGEX>:[\s\S]*"Table":\s*"[^"]*\.dim_ca"[\s\S]*"name":\s*"CTE_SCAN"[\s\S]*
+
+query I
+WITH cd_filtered AS MATERIALIZED (
+	SELECT cd_sk, marital, edu
+	FROM dim_cd
+	WHERE marital IN ('m0', 'm1', 'm2')
+	  AND edu IN ('e0', 'e1', 'e2')
+)
+SELECT count(*)
+FROM fact
+JOIN dim_ca ON fact.ca_sk = dim_ca.ca_sk
+JOIN cd_filtered ON fact.cd_sk = cd_filtered.cd_sk
+WHERE dim_ca.country = 'c0'
+  AND ((cd_filtered.marital = 'm0' AND cd_filtered.edu = 'e0' AND fact.price BETWEEN 100 AND 150)
+    OR (cd_filtered.marital = 'm1' AND cd_filtered.edu = 'e1' AND fact.price <= 50)
+    OR (cd_filtered.marital = 'm2' AND cd_filtered.edu = 'e2' AND fact.price >= 150))
+  AND ((dim_ca.state IN ('s0', 's2', 's4') AND fact.profit BETWEEN 0 AND 200)
+    OR (dim_ca.state IN ('s6', 's8', 's10') AND fact.profit BETWEEN 150 AND 300)
+    OR (dim_ca.state IN ('s12', 's14', 's16') AND fact.profit BETWEEN 50 AND 450));
+----
+55
+
+# 2) Overlapping ORs in AND fall back to 0.2 * 0.2 (~400 rows) instead of multiplying into ~1 row.
+statement ok
+CREATE TABLE ov_a AS SELECT i::INTEGER AS k, (i % 100)::INTEGER AS x FROM range(10000) r(i);
+
+statement ok
+CREATE TABLE ov_b AS SELECT i::INTEGER AS k FROM range(10000) r(i);
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT *
+FROM ov_a JOIN ov_b ON ov_a.k = ov_b.k
+WHERE (ov_a.x = 1 OR ov_b.k = 1)
+  AND (ov_a.x = 1 OR ov_b.k = 2);
+----
+logical_opt	<REGEX>:[\s\S]*"Join Type":\s*"INNER"[\s\S]*?"Estimated Cardinality":\s*"[3-5][0-9]{2}"[\s\S]*
+
+query I
+SELECT count(*)
+FROM ov_a JOIN ov_b ON ov_a.k = ov_b.k
+WHERE (ov_a.x = 1 OR ov_b.k = 1)
+  AND (ov_a.x = 1 OR ov_b.k = 2);
+----
+100
+
+statement ok
+SET disabled_optimizers='statistics_propagation';
+
+# 3) Unsatisfiable INNER residual OR below a LEFT JOIN boundary does not divide by zero.
+query I
+SELECT count(*)
+FROM (
+	fact JOIN dim_cd
+	  ON fact.cd_sk = dim_cd.cd_sk
+	 AND ((dim_cd.marital = NULL AND fact.price < 20)
+	   OR (dim_cd.edu = NULL AND fact.price > 180))
+)
+LEFT JOIN dim_ca ON fact.ca_sk = dim_ca.ca_sk;
+----
+0
+
+# 4) Sparse MIN_MAX domains (Parquet) are not trusted and retain the 0.2 fallback.
+require parquet
+
+statement ok
+RESET disabled_optimizers;
+
+statement ok
+COPY (
+	SELECT i AS id, ((i % 3) * 1000000)::BIGINT AS k, ((i % 3) * 1000000)::BIGINT AS j
+	FROM range(60000) r(i)
+) TO '{TEST_DIR}/residual_or_sparse.parquet';
+
+statement ok
+CREATE TABLE dense AS SELECT i AS id, (i % 100)::INTEGER AS v, (i % 50)::INTEGER AS w FROM range(60000) r(i);
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT count(*)
+FROM read_parquet('{TEST_DIR}/residual_or_sparse.parquet') s JOIN dense d ON s.id = d.id
+WHERE (s.k = 0 AND d.v < 10) OR (s.j = 1000000 AND d.v > 90);
+----
+logical_opt	<REGEX>:[\s\S]*"Join Type":\s*"INNER"[\s\S]*?"Estimated Cardinality":\s*"480"[\s\S]*
+
+# 5) Consecutive integer OR merged into a range (flag <= 1) tightens current_domain so residual
+#    selectivity does not double-count or flip the hash-join build side, even under 95% skew.
+statement ok
+CREATE TABLE dim_skew AS
+SELECT i::INTEGER AS s_sk, (CASE WHEN i % 20 != 0 THEN 0 ELSE (i // 20) % 99 + 1 END)::INTEGER AS flag
+FROM range(10000) r(i);
+
+statement ok
+CREATE TABLE dim_sel AS SELECT i::INTEGER AS t_sk, (i % 20)::INTEGER AS bucket FROM range(10000) r(i);
+
+statement ok
+CREATE TABLE f_skew AS
+SELECT i::INTEGER AS id, (i % 10000)::INTEGER AS s_sk, (i % 10000)::INTEGER AS t_sk, (i % 100)::INTEGER AS v
+FROM range(100000) r(i);
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT count(*)
+FROM f_skew f
+JOIN dim_skew s ON f.s_sk = s.s_sk
+JOIN dim_sel t ON f.t_sk = t.t_sk AND t.bucket = 1
+WHERE (s.flag = 0 AND f.v < 50) OR (s.flag = 1 AND f.v >= 90);
+----
+logical_opt	<REGEX>:[\s\S]*"Table":\s*"[^"]*\.dim_skew"[\s\S]*"Estimated Cardinality":\s*"[6-9][0-9]{2}"[\s\S]*"Table":\s*"[^"]*\.dim_sel"[\s\S]*
+
+query I
+SELECT count(*)
+FROM f_skew f
+JOIN dim_skew s ON f.s_sk = s.s_sk
+JOIN dim_sel t ON f.t_sk = t.t_sk AND t.bucket = 1
+WHERE (s.flag = 0 AND f.v < 50) OR (s.flag = 1 AND f.v >= 90);
+----
+3000
+
+# 6) Many-to-many high fan-out join with consecutive integer OR (x BETWEEN 1 AND 2) does not collapse.
+statement ok
+CREATE TABLE m1 AS SELECT i::INTEGER AS id, (i % 100)::INTEGER AS k, (i % 50)::INTEGER AS x FROM range(5000) r(i);
+
+statement ok
+CREATE TABLE m2 AS SELECT i::INTEGER AS id, (i % 100)::INTEGER AS k, (i % 50)::INTEGER AS y FROM range(5000) r(i);
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT count(*)
+FROM m1 JOIN m2 ON m1.k = m2.k
+WHERE (m1.x = 1 AND m2.y = 1) OR (m1.x = 2 AND m2.y = 2);
+----
+logical_opt	<REGEX>:[\s\S]*"Join Type":\s*"INNER"[\s\S]*?"Estimated Cardinality":\s*"[1-3][0-9]{3}"[\s\S]*
+
+query I
+SELECT count(*)
+FROM m1 JOIN m2 ON m1.k = m2.k
+WHERE (m1.x = 1 AND m2.y = 1) OR (m1.x = 2 AND m2.y = 2);
+----
+10000
+
+# 7) Equivalent join keys (a.k = b.k) across separate residual OR filters trigger overlap fallback.
+statement ok
+CREATE TABLE eq_a AS SELECT i::INTEGER AS id, (i % 100)::INTEGER AS k FROM range(10000) r(i);
+
+statement ok
+CREATE TABLE eq_b AS SELECT i::INTEGER AS id, (i % 100)::INTEGER AS k FROM range(10000) r(i);
+
+statement ok
+CREATE TABLE eq_c AS SELECT i::INTEGER AS id, (i % 100)::INTEGER AS x FROM range(10000) r(i);
+
+statement ok
+CREATE TABLE eq_d AS SELECT i::INTEGER AS id, (i % 100)::INTEGER AS y FROM range(10000) r(i);
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT count(*)
+FROM eq_a a
+JOIN eq_b b ON a.id = b.id AND a.k = b.k
+JOIN eq_c c ON a.id = c.id
+JOIN eq_d d ON a.id = d.id
+WHERE (a.k = 1 OR c.x = 1)
+  AND (b.k = 1 OR d.y = 2);
+----
+logical_opt	<REGEX>:[\s\S]*"name":\s*"COMPARISON_JOIN"[\s\S]*"Estimated Cardinality":\s*"[1-4][0-9]{2}"[\s\S]*"Expressions":\s*"count_star\(\)"[\s\S]*
+
+query I
+SELECT count(*)
+FROM eq_a a
+JOIN eq_b b ON a.id = b.id AND a.k = b.k
+JOIN eq_c c ON a.id = c.id
+JOIN eq_d d ON a.id = d.id
+WHERE (a.k = 1 OR c.x = 1)
+  AND (b.k = 1 OR d.y = 2);
+----
+100
+
+# 8) Cross-dimension residual OR in a star schema keeps comparison joins and avoids a dimension cross product.
+statement ok
+CREATE TABLE star_a AS SELECT i::INTEGER AS a_id, i::INTEGER AS x FROM range(5000) r(i);
+
+statement ok
+CREATE TABLE star_b AS SELECT i::INTEGER AS b_id, i::INTEGER AS y FROM range(5000) r(i);
+
+statement ok
+CREATE TABLE star_f AS
+SELECT i::INTEGER AS id, (i % 5000)::INTEGER AS a_id, (i % 5000)::INTEGER AS b_id
+FROM range(50000) r(i);
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT count(*)
+FROM star_f f
+JOIN star_a a ON f.a_id = a.a_id
+JOIN star_b b ON f.b_id = b.b_id
+WHERE a.x = 1 OR b.y = 1;
+----
+logical_opt	<REGEX>:[\s\S]*"name":\s*"COMPARISON_JOIN"[\s\S]*"name":\s*"COMPARISON_JOIN"[\s\S]*"Table":\s*"[^"]*\.star_f"[\s\S]*"Table":\s*"[^"]*\.star_a"[\s\S]*"Table":\s*"[^"]*\.star_b"[\s\S]*
+
+query I
+SELECT count(*)
+FROM star_f f
+JOIN star_a a ON f.a_id = a.a_id
+JOIN star_b b ON f.b_id = b.b_id
+WHERE a.x = 1 OR b.y = 1;
+----
+10
+
+# 9) Non-selective IS NOT NULL and != predicates inside an INNER residual OR do not add a 0.2 fallback penalty.
+statement ok
+CREATE TABLE ns_a AS
+SELECT i::INTEGER AS k, (i % 50)::INTEGER AS x, (CASE WHEN i % 10 = 0 THEN NULL ELSE i % 10 END)::INTEGER AS y
+FROM range(10000) r(i);
+
+statement ok
+CREATE TABLE ns_b AS
+SELECT i::INTEGER AS k, (i % 50)::INTEGER AS z
+FROM range(10000) r(i);
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT count(*)
+FROM ns_a a
+JOIN ns_b b ON a.k = b.k
+WHERE (a.x = 1 AND a.y IS NOT NULL AND b.z != 10)
+   OR (b.z = 2);
+----
+logical_opt	<REGEX>:[\s\S]*"Join Type":\s*"INNER"[\s\S]*?"Estimated Cardinality":\s*"([7-9][0-9]|1[0-1][0-9])"[\s\S]*
+
+query I
+SELECT count(*)
+FROM ns_a a
+JOIN ns_b b ON a.k = b.k
+WHERE (a.x = 1 AND a.y IS NOT NULL AND b.z != 10)
+   OR (b.z = 2);
+----
+400
+
+# 10) LEFT JOIN ON residual OR refines estimated cardinality below 0.2 and preserves unmatched left rows.
+statement ok
+CREATE TABLE lj_l AS
+SELECT i::INTEGER AS k, (i % 50)::INTEGER AS a
+FROM range(100) r(i);
+
+statement ok
+CREATE TABLE lj_r AS
+SELECT (i % 100)::INTEGER AS k, (i % 20)::INTEGER AS c, (i % 10)::INTEGER AS d
+FROM range(100000) r(i);
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT count(*)
+FROM lj_l l
+LEFT JOIN lj_r r
+  ON l.k = r.k
+ AND (l.a = 1 OR r.c = 1);
+----
+logical_opt	<REGEX>:[\s\S]*"Join Type":\s*"(LEFT|RIGHT)"[\s\S]*?"Estimated Cardinality":\s*"[5-8][0-9]{3}"[\s\S]*
+
+query I
+SELECT count(*)
+FROM lj_l l
+LEFT JOIN lj_r r
+  ON l.k = r.k
+ AND (l.a = 1 OR r.c = 1);
+----
+6094
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT count(*)
+FROM lj_l l
+LEFT JOIN lj_r r
+  ON l.k = r.k
+ AND ((l.a = 1 AND r.c = 1 AND r.d = 1)
+   OR (l.a = 2 AND r.c = 2 AND r.d = 2));
+----
+logical_opt	<REGEX>:[\s\S]*"Join Type":\s*"(LEFT|RIGHT)"[\s\S]*?"Estimated Cardinality":\s*"100"[\s\S]*
+
+query I
+SELECT count(*)
+FROM lj_l l
+LEFT JOIN lj_r r
+  ON l.k = r.k
+ AND ((l.a = 1 AND r.c = 1 AND r.d = 1)
+   OR (l.a = 2 AND r.c = 2 AND r.d = 2));
+----
+2098
